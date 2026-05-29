@@ -32,6 +32,28 @@ from nemo_rl.models.policy import PolicyConfig
 class MegatronGeneration(GenerationInterface):
     """Generation interface backed by Megatron for non-colocated inference."""
 
+    @staticmethod
+    def init_cluster_placement_groups(
+        cluster: RayVirtualCluster,
+        config: PolicyConfig,
+    ) -> None:
+        """Pre-initialize placement groups matching the strategy MegatronGeneration expects."""
+        megatron_cfg = config["megatron_cfg"]
+        model_parallel_size = (
+            megatron_cfg["tensor_model_parallel_size"]
+            * megatron_cfg["pipeline_model_parallel_size"]
+            * megatron_cfg["context_parallel_size"]
+        )
+        colocated = config["generation"]["colocated"]["enabled"]
+
+        strategy = None if colocated else "PACK"
+        needs_cross_node = model_parallel_size > cluster.num_gpus_per_node
+
+        cluster._init_placement_groups(
+            strategy=strategy,
+            use_unified_pg=needs_cross_node,
+        )
+
     def __init__(
         self,
         cluster: RayVirtualCluster,
