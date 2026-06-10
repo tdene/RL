@@ -57,7 +57,7 @@ from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
-from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from transformers import PreTrainedTokenizerBase
@@ -150,8 +150,11 @@ def setup_distributed() -> None:
     configure_dynamo_cache()
     # Ensure clean slate before import
     destroy_parallel_state()
-    # Need to initialize the process group before calling into Megatron-Bridge, otherwise Megatron-Bridge will try to set an incorrect device
-    torch.distributed.init_process_group("nccl")
+    # Pin the communicator to the correct GPU explicitly.
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.distributed.init_process_group(
+        "nccl", device_id=torch.device(f"cuda:{local_rank}")
+    )
 
 
 def validate_and_set_config(
@@ -505,6 +508,8 @@ def setup_model_config(
     if fmt == "megatron_lm":
         model_cfg.finalize()
 
+    model_cfg.__post_init__()
+
     # Create checkpoint configs
     checkpoint_config = _create_checkpoint_config(
         pretrained_path, weights_path, optimizer_path
@@ -581,6 +586,26 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.moe_token_dispatcher_type = config["megatron_cfg"][
         "moe_token_dispatcher_type"
     ]
+    if "inference_moe_token_dispatcher_type" in config["megatron_cfg"]:
+        model_cfg.inference_moe_token_dispatcher_type = config["megatron_cfg"][
+            "inference_moe_token_dispatcher_type"
+        ]
+    if "inference_grouped_gemm_backend" in config["megatron_cfg"]:
+        model_cfg.inference_grouped_gemm_backend = config["megatron_cfg"][
+            "inference_grouped_gemm_backend"
+        ]
+    if "moe_router_num_groups" in config["megatron_cfg"]:
+        model_cfg.moe_router_num_groups = config["megatron_cfg"][
+            "moe_router_num_groups"
+        ]
+    if "moe_router_group_topk" in config["megatron_cfg"]:
+        model_cfg.moe_router_group_topk = config["megatron_cfg"][
+            "moe_router_group_topk"
+        ]
+    if "moe_pad_experts_for_cuda_graph_inference" in config["megatron_cfg"]:
+        model_cfg.moe_pad_experts_for_cuda_graph_inference = config["megatron_cfg"][
+            "moe_pad_experts_for_cuda_graph_inference"
+        ]
     model_cfg.moe_shared_expert_overlap = config["megatron_cfg"][
         "moe_shared_expert_overlap"
     ]
@@ -718,6 +743,16 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
                 f"Invalid attention backend: {attention_backend}. "
                 f"Available backends are: {list(AttnBackend.__members__.keys())}"
             )
+
+    # These overrides need to be applied before the workers spawn.
+    if "transformer_impl" in config["megatron_cfg"]:
+        model_cfg.transformer_impl = config["megatron_cfg"]["transformer_impl"]
+    if "cuda_graph_impl" in config["megatron_cfg"]:
+        model_cfg.cuda_graph_impl = config["megatron_cfg"]["cuda_graph_impl"]
+        if "inference_cuda_graph_scope" in config["megatron_cfg"]:
+            model_cfg.inference_cuda_graph_scope = InferenceCudaGraphScope[
+                config["megatron_cfg"]["inference_cuda_graph_scope"]
+            ]
 
     # FP8 configuration
     fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
@@ -1110,6 +1145,7 @@ def setup_model_and_optimizer(
         pre_wrap_hook=pre_wrap_hook,
         mixed_precision_wrapper=mixed_precision_wrapper,
         pg_collection=pg_collection,
+        wrap_with_ddp=load_optimizer,
     )
 
     if load_optimizer:
