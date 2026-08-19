@@ -16,6 +16,7 @@ import gc
 from copy import deepcopy
 
 import pytest
+import ray
 import torch
 
 from nemo_rl.algorithms.grpo import refit_policy_generation
@@ -531,5 +532,297 @@ def test_megatron_generation_non_colocated_refit(
             generation_cluster.shutdown()
         except Exception as e:
             print(f"Error during generation_cluster shutdown: {e}")
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+# --- Mamba decode-cache freshness matrix -------------------------------------
+#
+# Reproduction for the MambaMixer ``_A_neg_exp_cache`` staleness (MLM #4414's
+# capture-time guard, weakened by #4455): decode serves a cached ``-exp(A_log)``
+# whose only refresh trigger is ``train(True)`` followed by an eager execution
+# of the guard. A model whose weights arrive by refit never arms the flag, so
+# decode keeps the values baked at the first fill while every refit updates the
+# ``A_log`` parameter underneath it.
+#
+# Oracles per generation:
+#   * black-box: generation logprobs vs the training model's live forward
+#     (same <= 1.05 avg-prob-mult-error gate as the refit test above);
+#   * white-box (colocated cells only, where the debug worker extension reaches
+#     the serving model): per-mixer cache vs ``-exp(A_log)``.
+# Between the two generations every ``A_log`` is shifted by +1.0 (log space) —
+# a deterministic, loud stand-in for RL drift.
+#
+# Expected outcomes on the current (pre-fix) code:
+#   N1 graphed non-colocated : FAIL at generation 1 (init-A baked at engine
+#                              construction, before the first refit) — the
+#                              field report's case.
+#   N2 eager non-colocated   : diagnostic — measures whether construction
+#                              decodes without graphs; FAIL at generation 2.
+#   D1/D2 dual-mode          : PASS (training model, armed every cycle; hybrid
+#                              dual-mode decode runs eagerly, so refills land).
+#   R1 graphed reshard       : PASS gen 1 (swap precedes capture), FAIL gen 2.
+#   R2 eager reshard         : diagnostic — FAIL at generation 2.
+# Dense models are the control: the existing tests in this file cover them.
+# All cells assert the CORRECT behavior; red cells on today's code are the
+# reproduction, and the same matrix is the acceptance suite for the fix.
+
+_MAMBA_DEBUG_WORKER_FQN = (
+    "tests.unit.models.generation.mamba_cache_debug_worker."
+    "MambaCacheDebugMegatronWorker"
+)
+
+_A_LOG_PERTURBATION = 1.0
+_PARITY_GATE = 1.05
+
+_CACHE_MATRIX_CELLS = [
+    pytest.param("N1", False, False, "local", id="N1_noncolocated_graphed"),
+    pytest.param(
+        "N2",
+        False,
+        False,
+        "none",
+        id="N2_noncolocated_eager",
+        marks=pytest.mark.skip(reason="one-time diagnostic cell; run manually"),
+    ),
+    pytest.param("D1", True, False, "local", id="D1_dualmode_graphed"),
+    pytest.param(
+        "D2",
+        True,
+        False,
+        "none",
+        id="D2_dualmode_eager",
+        marks=pytest.mark.skip(reason="one-time diagnostic cell; run manually"),
+    ),
+    pytest.param("R1", True, True, "local", id="R1_reshard_graphed"),
+    pytest.param(
+        "R2",
+        True,
+        True,
+        "none",
+        id="R2_reshard_eager",
+        marks=pytest.mark.skip(reason="one-time diagnostic cell; run manually"),
+    ),
+]
+
+
+def _tiny_hybrid_config(model_path, *, colocated, reshard, cuda_graph_impl):
+    """Derive the matrix cell's PolicyConfig from the shared test config."""
+    config = deepcopy(basic_megatron_test_config)
+    config["model_name"] = model_path
+    config["tokenizer"] = {"name": model_path}
+    config["generation"]["model_name"] = model_path
+    config["generation"]["colocated"]["enabled"] = colocated
+    mcfg = config["megatron_cfg"]
+    mcfg["converter_type"] = "NemotronHForCausalLM"
+    # NemotronH has no rope (position_embedding_type "none") and squared-relu MLPs.
+    mcfg["apply_rope_fusion"] = False
+    mcfg["bias_activation_fusion"] = False
+    mcfg["tensor_model_parallel_size"] = 2 if reshard else 1
+    gen_cfg = config["generation"]["mcore_generation_config"]
+    gen_cfg["cuda_graph_impl"] = cuda_graph_impl
+    if reshard:
+        # A differing layout + impl forces the dedicated inference model (#3490).
+        gen_cfg["tensor_model_parallel_size"] = 1
+        gen_cfg["transformer_impl"] = "inference_optimized"
+    return config
+
+
+def _hybrid_test_input(tokenizer):
+    prompts = ["Hello, my name is", "The capital of France is"]
+    encodings = tokenizer(
+        prompts,
+        padding="max_length",
+        max_length=20,
+        truncation=True,
+        return_tensors="pt",
+        padding_side="right",
+    )
+    input_lengths = encodings["attention_mask"].sum(dim=1).to(torch.int32)
+    return BatchedDataDict(
+        {"input_ids": encodings["input_ids"], "input_lengths": input_lengths}
+    )
+
+
+def _run_debug(policy, method, **kwargs):
+    """Run a debug-extension RPC on every policy worker and gather the results."""
+    return ray.get(policy.worker_group.run_all_workers_single_data(method, **kwargs))
+
+
+def _generation_parity(policy, outputs, input_data):
+    """Avg prob mult error between generation logprobs and the live training model."""
+    fprop_data = BatchedDataDict(
+        {
+            "input_ids": outputs["output_ids"],
+            "input_lengths": outputs["unpadded_sequence_lengths"],
+        }
+    )
+    policy.prepare_for_lp_inference()
+    train_logprobs = policy.get_logprobs(fprop_data)["logprobs"]
+    gen_mask = torch.zeros_like(outputs["logprobs"], dtype=torch.bool)
+    for i, (start, end) in enumerate(
+        zip(input_data["input_lengths"], outputs["unpadded_sequence_lengths"])
+    ):
+        gen_mask[i, start:end] = True
+    abs_diff = (outputs["logprobs"] - train_logprobs).abs().masked_select(gen_mask)
+    return torch.exp(abs_diff).mean().item()
+
+
+@pytest.mark.mcore
+@pytest.mark.timeout(1800)
+@pytest.mark.parametrize(
+    "cell,colocated,reshard,cuda_graph_impl",
+    _CACHE_MATRIX_CELLS,
+)
+def test_mamba_decode_cache_freshness(
+    tiny_nemotronh_model_path, cell, colocated, reshard, cuda_graph_impl
+):
+    """Refit-delivered A_log updates must reach hybrid decode (matrix above)."""
+    config = _tiny_hybrid_config(
+        tiny_nemotronh_model_path,
+        colocated=colocated,
+        reshard=reshard,
+        cuda_graph_impl=cuda_graph_impl,
+    )
+    hybrid_tokenizer = get_tokenizer({"name": tiny_nemotronh_model_path})
+    input_data = _hybrid_test_input(hybrid_tokenizer)
+
+    policy = None
+    mg = None
+    train_cluster = None
+    gen_cluster = None
+    try:
+        if colocated:
+            train_cluster = RayVirtualCluster(
+                bundle_ct_per_node_list=[2],
+                use_gpus=True,
+                max_colocated_worker_groups=2,
+                num_gpus_per_node=2,
+                name=f"mamba-cache-{cell}-cluster",
+            )
+            if train_cluster.num_gpus_per_node < 2:
+                pytest.skip("Need 2 GPUs for the colocated cells")
+            policy = Policy(
+                cluster=train_cluster,
+                config=config,
+                tokenizer=hybrid_tokenizer,
+                worker_extension_cls_fqn=_MAMBA_DEBUG_WORKER_FQN,
+            )
+            # Engine (and any CUDA-graph capture) starts inside construction.
+            mg = MegatronGeneration(
+                config=config, tokenizer=hybrid_tokenizer, policy=policy
+            )
+        else:
+            train_cluster = RayVirtualCluster(
+                bundle_ct_per_node_list=[1],
+                use_gpus=True,
+                max_colocated_worker_groups=1,
+                num_gpus_per_node=1,
+                name=f"mamba-cache-{cell}-policy-cluster",
+            )
+            gen_cluster = RayVirtualCluster(
+                bundle_ct_per_node_list=[1],
+                use_gpus=True,
+                max_colocated_worker_groups=1,
+                num_gpus_per_node=1,
+                name=f"mamba-cache-{cell}-generation-cluster",
+            )
+            policy = Policy(
+                cluster=train_cluster,
+                config=config,
+                tokenizer=hybrid_tokenizer,
+                worker_extension_cls_fqn=_MAMBA_DEBUG_WORKER_FQN,
+            )
+            # skip_weight_load=True is main's wiring for non-colocated
+            # (grpo.py setup): random init, populated entirely by refit.
+            mg = MegatronGeneration(
+                config=config,
+                tokenizer=hybrid_tokenizer,
+                cluster=gen_cluster,
+                skip_weight_load=True,
+            )
+            mg.weight_synchronizer = MegatronWeightSynchronizer(
+                policy,
+                mg,
+                colocated=False,
+                train_cluster=train_cluster,
+                inference_cluster=gen_cluster,
+            )
+            mg.weight_synchronizer.init_communicator()
+            refit_policy_generation(policy, mg, False)
+
+        graphs_report = _run_debug(policy, "debug_graphs_report")
+        print(f"[{cell}] graphs-engaged probe: {graphs_report}")
+
+        # Cycle 1: generate with the initial (refit-delivered or shared) weights.
+        outputs1 = mg.generate(input_data, greedy=False)
+        _assert_valid_generation_output(outputs1, input_data)
+        if colocated:
+            mg.finish_generation()
+        parity1 = _generation_parity(policy, outputs1, input_data)
+        cache1 = _run_debug(policy, "debug_mamba_cache_report") if colocated else None
+        print(f"[{cell}] generation 1: parity={parity1:.4f} cache={cache1}")
+
+        # The deterministic RL-drift stand-in, plus the arming the training
+        # phase would perform in dual-mode (the engine serves the training
+        # model there, and the loop's train step is what arms the cache).
+        perturbed = _run_debug(
+            policy, "debug_perturb_mamba_a_log", delta=_A_LOG_PERTURBATION
+        )
+        assert all(count > 0 for count in perturbed), (
+            f"[{cell}] no Mamba mixers found to perturb: {perturbed}"
+        )
+        if colocated and not reshard:
+            _run_debug(policy, "debug_toggle_train_mode")
+
+        # Cycle 2: deliver the new weights exactly the way the loop does.
+        if colocated:
+            mg.prepare_for_generation()
+        else:
+            refit_policy_generation(policy, mg, False)
+        outputs2 = mg.generate(input_data, greedy=False)
+        _assert_valid_generation_output(outputs2, input_data)
+        if colocated:
+            mg.finish_generation()
+        parity2 = _generation_parity(policy, outputs2, input_data)
+        cache2 = _run_debug(policy, "debug_mamba_cache_report") if colocated else None
+        print(f"[{cell}] generation 2: parity={parity2:.4f} cache={cache2}")
+
+        assert parity1 <= _PARITY_GATE, (
+            f"[{cell}] generation-1 logprobs diverge from the training model "
+            f"(avg prob mult error {parity1:.4f}): decode is serving weights "
+            f"that never matched the policy (init-A baked before the first "
+            f"refit); cache report: {cache1}"
+        )
+        assert parity2 <= _PARITY_GATE, (
+            f"[{cell}] generation-2 logprobs diverge from the training model "
+            f"(avg prob mult error {parity2:.4f}): the refit-delivered A_log "
+            f"update never reached decode (stale -exp(A_log) cache); "
+            f"cache report: {cache2}"
+        )
+        if cache2 is not None:
+            # _run_debug gathers one report list per worker; flatten them.
+            serving_model = "inference" if reshard else "train"
+            flat = [entry for worker_report in cache2 for entry in worker_report]
+            stale = [
+                entry
+                for entry in flat
+                if entry["model"] == serving_model and not entry["cache_fresh"]
+            ]
+            assert not stale, (
+                f"[{cell}] stale decode caches on the serving model after the "
+                f"weight update: {stale}"
+            )
+    finally:
+        if mg is not None:
+            mg.shutdown()
+        if policy is not None:
+            policy.shutdown()
+        for vc in (gen_cluster, train_cluster):
+            if vc is not None:
+                try:
+                    vc.shutdown()
+                except Exception as e:
+                    print(f"Error during cluster shutdown: {e}")
         gc.collect()
         torch.cuda.empty_cache()

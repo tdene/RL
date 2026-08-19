@@ -635,6 +635,48 @@ def tiny_llama_tied_model_path():
 
 
 @pytest.fixture(scope="session")
+def tiny_nemotronh_model_path():
+    """Fixture that returns a path to a tiny NemotronH hybrid model (Mamba2 + attention + MLP).
+
+    Used by the Mamba decode-cache freshness tests: dense models have no
+    ``_A_neg_exp_cache``, so hybrid coverage needs its own tiny model.
+    """
+    import shutil
+
+    pytest.importorskip("transformers.models.nemotron_h")
+    from transformers import AutoTokenizer, NemotronHConfig, NemotronHForCausalLM
+
+    model_path = os.path.join(TEST_ASSETS_DIR, "tiny_nemotronh_with_llama3.2_tokenizer")
+    # Dims chosen TP2-safe (every sharded dim divisible by 2) and Mamba2-consistent:
+    # d_inner = mamba_num_heads * mamba_head_dim = 256 = 2 * hidden_size.
+    # Pattern "M*M-" = mamba, attention, mamba, MLP (no MoE: isolates the A cache).
+    # vocab_size=128256 so we can re-use the llama3.2 1b tokenizer.
+    config = NemotronHConfig(
+        num_hidden_layers=4,
+        hybrid_override_pattern="M*M-",
+        hidden_size=128,
+        intermediate_size=256,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        mamba_num_heads=8,
+        mamba_head_dim=32,
+        ssm_state_size=64,
+        n_groups=2,
+        chunk_size=128,
+        vocab_size=128256,
+        tie_word_embeddings=False,
+        use_bias=False,
+    )
+    model = NemotronHForCausalLM(config=config)
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
+    shutil.rmtree(model_path, ignore_errors=True)
+    model.save_pretrained(model_path)
+    tokenizer.save_pretrained(model_path)
+    del model, tokenizer
+    yield model_path
+
+
+@pytest.fixture(scope="session")
 def tiny_qwen2_model_path():
     """Fixture that returns a path to a tiny llama model with a dummy tokenizer."""
     import shutil
