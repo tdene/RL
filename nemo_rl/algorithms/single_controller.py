@@ -2167,6 +2167,8 @@ class SingleControllerActor:
             )  # type: ignore
 
             total_time = timing_metrics.get("total_step_time", 0.0)
+            # Greppable golden-value line for calibrating nightly step-time gates.
+            print(f"GOLDEN_TIMING total_step_time_s={total_time:.2f}", flush=True)
             total_num_gpus = int(ray.cluster_resources().get("GPU", 0))
             if (
                 total_time > 0

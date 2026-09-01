@@ -3967,6 +3967,8 @@ def grpo_train(
             print("\n⏱️  Timing:", flush=True)
             # Display total time first, separately
             total_time = timing_metrics.get("total_step_time", 0)
+            # Greppable golden-value line for calibrating nightly step-time gates.
+            print(f"GOLDEN_TIMING total_step_time_s={total_time:.2f}", flush=True)
 
             number_of_samples_per_step = (
                 master_config.grpo.num_prompts_per_step
@@ -5815,6 +5817,8 @@ def async_grpo_train(
 
             print("\n⏱️  Timing:")
             total_time = timing_metrics.get("total_step_time", 0)
+            # Greppable golden-value line for calibrating nightly step-time gates.
+            print(f"GOLDEN_TIMING total_step_time_s={total_time:.2f}", flush=True)
             print(f"  • Total step time: {total_time:.2f}s")
             for k, v in sorted(
                 timing_metrics.items(), key=lambda item: item[1], reverse=True
