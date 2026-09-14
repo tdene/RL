@@ -1,0 +1,12 @@
+defaults: ./vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-megatron-tp8ep16.v1.yaml
+loss_fn:
+  use_importance_sampling_correction: true
+checkpointing:
+  checkpoint_dir: results/vlm_grpo_nemotron_omni_mmpr_megatron_topp0.9_topk50_is
+policy:
+  generation:
+    top_p: 0.9
+    top_k: 50
+logger:
+  wandb:
+    name: nemotron-omni-mmpr-megatron-topp0.9-topk50-is
