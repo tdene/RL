@@ -36,7 +36,10 @@ policy:
       load_format: auto
       enforce_eager: false
       max_model_len: ${policy.max_total_sequence_length}
-      gpu_memory_utilization: 0.75
+      # 0.75 left no headroom: the offloaded Megatron worker still holds ~12 GiB on
+      # the same GPU (CUDA context, TP8xEP16 NCCL communicators, allocator reserve),
+      # and step-3 generation OOMed. 0.6 trades KV cache for that headroom.
+      gpu_memory_utilization: 0.6
     vllm_kwargs:
       max_num_batched_tokens: 32768
       max_num_seqs: 512
